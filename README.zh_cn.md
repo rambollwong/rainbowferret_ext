@@ -5,7 +5,7 @@ RainbowFerret 生态扩展库，旨在解决原库 `github.com/rambollwong/rainb
 ## 安装
 
 ```bash
-go get rambollwong/rainbowproject/rainbowferret_ext@latest
+go get github.com/rambollwong/rainbowferret_ext@latest
 ```
 
 ## util — 请求绑定

@@ -1,4 +1,4 @@
-module rambollwong/rainbowproject/rainbowferret_ext
+module github.com/rambollwong/rainbowferret_ext
 
 go 1.26.0
 

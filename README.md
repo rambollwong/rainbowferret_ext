@@ -5,7 +5,7 @@ RainbowFerret ecosystem extension library, aimed at resolving the constraint tha
 ## Installation
 
 ```bash
-go get rambollwong/rainbowproject/rainbowferret_ext@latest
+go get github.com/rambollwong/rainbowferret_ext@latest
 ```
 
 ## util — Request binding
