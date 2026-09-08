@@ -51,6 +51,34 @@ var (
 	// BreakerCooldown is how long the circuit breaker stays open.
 	// BreakerCooldown 是熔断打开后的冷却时长。
 	BreakerCooldown = 30 * time.Second
+
+	// ExcludedHeaders lists response headers that are never cached. It
+	// defaults to hop-by-hop headers, Set-Cookie, and per-request tracing
+	// headers such as X-Request-Id.
+	// ExcludedHeaders 列出永不缓存的响应头。默认包含 hop-by-hop 头、
+	// Set-Cookie 以及 X-Request-Id 等每次请求都不同的链路追踪头。
+	ExcludedHeaders = map[string]bool{
+		"Connection":          true,
+		"Keep-Alive":          true,
+		"Transfer-Encoding":   true,
+		"Upgrade":             true,
+		"Proxy-Authenticate":  true,
+		"Proxy-Authorization": true,
+		"TE":                  true,
+		"Trailer":             true,
+		"Set-Cookie":          true,
+		"X-Request-Id":        true,
+		"X-Correlation-Id":    true,
+		"X-Trace-Id":          true,
+		"X-Span-Id":           true,
+		"X-B3-TraceId":        true,
+		"X-B3-SpanId":         true,
+		"X-B3-ParentSpanId":   true,
+		"X-B3-Sampled":        true,
+		"X-B3-Flags":          true,
+		"Traceparent":         true,
+		"Tracestate":          true,
+	}
 )
 
 // CacheMetricEvent identifies the kind of cache metric event.
@@ -442,21 +470,17 @@ func ttlForStatus(ttl time.Duration, status int, extra map[int]bool) time.Durati
 	}
 }
 
-// filteredHeaders returns a copy of the response headers with hop-by-hop
-// headers and Set-Cookie removed. It returns nil when nothing remains.
-// filteredHeaders 返回剔除 hop-by-hop 头与 Set-Cookie 后的响应头副本；
-// 无剩余内容时返回 nil。
+// filteredHeaders returns a copy of the response headers with ExcludedHeaders
+// removed, plus any headers listed by Connection. It returns nil when nothing
+// remains.
+// filteredHeaders 返回剔除 ExcludedHeaders 以及 Connection 中所列头之后的
+// 响应头副本；无剩余内容时返回 nil。
 func filteredHeaders(h http.Header) http.Header {
-	excluded := map[string]bool{
-		"Connection":          true,
-		"Keep-Alive":          true,
-		"Transfer-Encoding":   true,
-		"Upgrade":             true,
-		"Proxy-Authenticate":  true,
-		"Proxy-Authorization": true,
-		"TE":                  true,
-		"Trailer":             true,
-		"Set-Cookie":          true,
+	excluded := make(map[string]bool, len(ExcludedHeaders))
+	for name, skip := range ExcludedHeaders {
+		if skip {
+			excluded[http.CanonicalHeaderKey(name)] = true
+		}
 	}
 	// Headers listed by Connection are also hop-by-hop.
 	// Connection 中列出的头同样视为 hop-by-hop。
@@ -483,12 +507,12 @@ func filteredHeaders(h http.Header) http.Header {
 
 // store serializes the captured response and writes it to Redis. It reports
 // whether the response was actually cached; oversized, streamed or Vary: *
-// responses are skipped without error. Hop-by-hop headers and Set-Cookie are
+// responses are skipped without error. Headers listed in ExcludedHeaders are
 // filtered from the cached headers. Vary responses are stored under a variant
 // key with a base index entry.
 // store 序列化捕获的响应并写入 Redis，返回是否真正写入了缓存。
 // 过大、流式或 Vary: * 的响应会被跳过且不返回错误。缓存头会剔除
-// hop-by-hop 头与 Set-Cookie。带 Vary 的响应按变体 key 存储，并在基础 key
+// ExcludedHeaders 中列出的头。带 Vary 的响应按变体 key 存储，并在基础 key
 // 写入索引条目。
 func store(client *redis.Client, ctx context.Context, key string, r *http.Request, w *cacheWriter, ttl time.Duration) (bool, error) {
 	if w.tooBig || w.streamed {

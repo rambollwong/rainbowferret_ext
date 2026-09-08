@@ -690,3 +690,64 @@ func TestRedisCacheVaryStarSkipsCache(t *testing.T) {
 		t.Fatalf("Vary: * should not be cached, calls=%d", calls)
 	}
 }
+
+func TestRedisCacheFiltersTracingHeaders(t *testing.T) {
+	client := newTestRedis(t)
+	mw := RedisCache(client, time.Minute, nil)
+
+	calls := 0
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("X-Request-Id", "req-1")
+		w.Header().Set("Traceparent", "00-abc-123-01")
+		w.Header().Set("X-Keep", "yes")
+		w.Write([]byte("ok"))
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/tracing", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first status: %d", rec.Code)
+	}
+
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/tracing", nil))
+	if rec2.Code != http.StatusOK || rec2.Body.String() != "ok" {
+		t.Fatalf("cached response: code=%d body=%q", rec2.Code, rec2.Body.String())
+	}
+	if rec2.Header().Get("X-Keep") != "yes" {
+		t.Fatalf("X-Keep should be cached: %q", rec2.Header().Get("X-Keep"))
+	}
+	if rec2.Header().Get("X-Request-Id") != "" {
+		t.Fatalf("X-Request-Id should be filtered, got %q", rec2.Header().Get("X-Request-Id"))
+	}
+	if rec2.Header().Get("Traceparent") != "" {
+		t.Fatalf("Traceparent should be filtered, got %q", rec2.Header().Get("Traceparent"))
+	}
+	if calls != 1 {
+		t.Fatalf("response should be cached, calls=%d", calls)
+	}
+}
+
+func TestRedisCacheExcludedHeadersConfigurable(t *testing.T) {
+	old := ExcludedHeaders["X-Keep"]
+	ExcludedHeaders["X-Keep"] = true
+	defer func() { ExcludedHeaders["X-Keep"] = old }()
+
+	client := newTestRedis(t)
+	mw := RedisCache(client, time.Minute, nil)
+
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Keep", "yes")
+		w.Write([]byte("ok"))
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/excluded-config", nil))
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/excluded-config", nil))
+
+	if rec2.Header().Get("X-Keep") != "" {
+		t.Fatalf("X-Keep should be excluded after config, got %q", rec2.Header().Get("X-Keep"))
+	}
+}
