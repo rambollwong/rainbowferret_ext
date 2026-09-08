@@ -9,6 +9,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -87,11 +90,14 @@ func reportMetric(event CacheMetricEvent, key, method string) {
 }
 
 // cacheEntry is the payload stored in Redis: the response status code,
-// Content-Type and body. cacheEntry 是存入 Redis 的载荷：状态码、Content-Type 与响应体。
+// Content-Type (or full headers when applicable) and body.
+// cacheEntry 是存入 Redis 的载荷：状态码、Content-Type（或适用时的完整响应头）与响应体。
 type cacheEntry struct {
-	Status      int    `json:"status"`
-	ContentType string `json:"content_type,omitempty"`
-	Body        []byte `json:"body,omitempty"`
+	Status      int         `json:"status"`
+	ContentType string      `json:"content_type,omitempty"`
+	Headers     http.Header `json:"headers,omitempty"`
+	Body        []byte      `json:"body,omitempty"`
+	Vary        []string    `json:"vary,omitempty"`
 }
 
 // cacheWriter captures the response status and body for caching.
@@ -209,6 +215,10 @@ func (b *cacheBreaker) recordFailure() {
 // operations run with RedisOpTimeout; after consecutive failures the breaker
 // opens and Redis is skipped for BreakerCooldown.
 //
+// extraStatusCodes optionally adds HTTP status codes (besides 2xx and 404)
+// that participate in caching, such as 302 for redirects. They are cached with
+// ttl.
+//
 // RedisCache 返回缓存中间件。缓存键由请求路径与查询串组成（HTTP method 不参与）：
 //
 //   - GET：懒加载。命中时直接回放缓存响应；未命中时在 singleflight 下执行
@@ -223,11 +233,21 @@ func (b *cacheBreaker) recordFailure() {
 //
 // 缓存层错误不会导致请求失败。onError 非 nil 时会被调用；为 nil 时错误被静默忽略。
 // Redis 操作带 RedisOpTimeout 超时；连续失败后熔断打开，BreakerCooldown 内跳过 Redis。
-func RedisCache(client *redis.Client, ttl time.Duration, onError func(error)) func(next http.Handler) http.Handler {
+//
+// extraStatusCodes 可选，用于额外指定参与缓存的状态码（2xx 与 404 之外），
+// 例如 302 重定向；这些状态码按 ttl 缓存。
+func RedisCache(client *redis.Client, ttl time.Duration, onError func(error), extraStatusCodes ...int) func(next http.Handler) http.Handler {
 	var (
 		breaker cacheBreaker
 		sf      singleflight.Group
 	)
+
+	extra := make(map[int]bool, len(extraStatusCodes))
+	for _, code := range extraStatusCodes {
+		if code >= 100 && code <= 999 {
+			extra[code] = true
+		}
+	}
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -237,16 +257,12 @@ func RedisCache(client *redis.Client, ttl time.Duration, onError func(error)) fu
 			switch r.Method {
 			case http.MethodGet:
 				if breaker.allow() {
-					val, err := getWithTimeout(client, ctx, key)
+					hit, err := lookupAndReplay(w, client, ctx, key, r, false)
 					switch {
-					case err == nil:
-						if cerr := writeCached(w, val, false); cerr == nil {
-							reportMetric(CacheMetricHit, key, r.Method)
-							breaker.recordSuccess()
-							return
-						} else {
-							report(onError, fmt.Errorf("redis cache: decode key %q: %w", key, cerr))
-						}
+					case err == nil && hit:
+						reportMetric(CacheMetricHit, key, r.Method)
+						breaker.recordSuccess()
+						return
 					case errors.Is(err, redis.Nil):
 						breaker.recordSuccess()
 					default:
@@ -261,7 +277,7 @@ func RedisCache(client *redis.Client, ttl time.Duration, onError func(error)) fu
 					reportMetric(CacheMetricMiss, key, r.Method)
 					cw := &cacheWriter{ResponseWriter: w}
 					next.ServeHTTP(cw, r)
-					cacheAndRecord(&breaker, client, ctx, key, cw, ttl, onError)
+					cacheAndRecord(&breaker, client, ctx, key, r, cw, ttl, onError, extra)
 					return nil, nil
 				})
 				if led {
@@ -269,16 +285,15 @@ func RedisCache(client *redis.Client, ttl time.Duration, onError func(error)) fu
 				}
 
 				if breaker.allow() {
-					val, err := getWithTimeout(client, ctx, key)
-					if err == nil {
-						if cerr := writeCached(w, val, false); cerr == nil {
-							reportMetric(CacheMetricHit, key, r.Method)
-							breaker.recordSuccess()
-							return
-						} else {
-							report(onError, fmt.Errorf("redis cache: decode key %q: %w", key, cerr))
-						}
-					} else if !errors.Is(err, redis.Nil) {
+					hit, err := lookupAndReplay(w, client, ctx, key, r, false)
+					switch {
+					case err == nil && hit:
+						reportMetric(CacheMetricHit, key, r.Method)
+						breaker.recordSuccess()
+						return
+					case errors.Is(err, redis.Nil):
+						breaker.recordSuccess()
+					default:
 						report(onError, fmt.Errorf("redis cache: get key %q: %w", key, err))
 						breaker.recordFailure()
 					}
@@ -288,16 +303,15 @@ func RedisCache(client *redis.Client, ttl time.Duration, onError func(error)) fu
 
 			case http.MethodHead:
 				if breaker.allow() {
-					val, err := getWithTimeout(client, ctx, key)
-					if err == nil {
-						if cerr := writeCached(w, val, true); cerr == nil {
-							reportMetric(CacheMetricHit, key, r.Method)
-							breaker.recordSuccess()
-							return
-						} else {
-							report(onError, fmt.Errorf("redis cache: decode key %q: %w", key, cerr))
-						}
-					} else if !errors.Is(err, redis.Nil) {
+					hit, err := lookupAndReplay(w, client, ctx, key, r, true)
+					switch {
+					case err == nil && hit:
+						reportMetric(CacheMetricHit, key, r.Method)
+						breaker.recordSuccess()
+						return
+					case errors.Is(err, redis.Nil):
+						breaker.recordSuccess()
+					default:
 						report(onError, fmt.Errorf("redis cache: get key %q: %w", key, err))
 						breaker.recordFailure()
 					}
@@ -308,7 +322,7 @@ func RedisCache(client *redis.Client, ttl time.Duration, onError func(error)) fu
 			case http.MethodPost, http.MethodPut, http.MethodPatch:
 				cw := &cacheWriter{ResponseWriter: w}
 				next.ServeHTTP(cw, r)
-				cacheAndRecord(&breaker, client, ctx, key, cw, ttl, onError)
+				cacheAndRecord(&breaker, client, ctx, key, r, cw, ttl, onError, extra)
 
 			case http.MethodDelete:
 				cw := &cacheWriter{ResponseWriter: w}
@@ -335,15 +349,15 @@ func RedisCache(client *redis.Client, ttl time.Duration, onError func(error)) fu
 // breaker untouched.
 // cacheAndRecord 在适用时写入捕获的响应并更新熔断器。被跳过的响应
 // （不可缓存、过大、流式）不改变熔断器状态。
-func cacheAndRecord(breaker *cacheBreaker, client *redis.Client, ctx context.Context, key string, w *cacheWriter, ttl time.Duration, onError func(error)) {
+func cacheAndRecord(breaker *cacheBreaker, client *redis.Client, ctx context.Context, key string, r *http.Request, w *cacheWriter, ttl time.Duration, onError func(error), extra map[int]bool) {
 	if !breaker.allow() {
 		return
 	}
-	cacheableTTL := ttlForStatus(ttl, w.status)
+	cacheableTTL := ttlForStatus(ttl, w.status, extra)
 	if cacheableTTL < 0 {
 		return
 	}
-	cached, err := store(client, ctx, key, w, cacheableTTL)
+	cached, err := store(client, ctx, key, r, w, cacheableTTL)
 	if err != nil {
 		report(onError, fmt.Errorf("redis cache: store key %q: %w", key, err))
 		breaker.recordFailure()
@@ -362,6 +376,41 @@ func report(onError func(error), err error) {
 	}
 }
 
+// parseVary parses the Vary header values into a sorted, deduplicated header
+// name list. It reports noCache=true when Vary: * makes the response
+// uncacheable per variant.
+// parseVary 将 Vary 头解析为去重排序的头名列表。出现 Vary: * 时
+// 返回 noCache=true，表示无法按变体缓存。
+func parseVary(values []string) (vary []string, noCache bool) {
+	seen := make(map[string]bool)
+	for _, v := range values {
+		for _, name := range strings.Split(v, ",") {
+			name = strings.TrimSpace(name)
+			if name == "*" {
+				return nil, true
+			}
+			if name != "" && !seen[name] {
+				seen[name] = true
+				vary = append(vary, name)
+			}
+		}
+	}
+	sort.Strings(vary)
+	return vary, false
+}
+
+// varyKey builds the variant cache key for a base key and the request's values
+// of the Vary header names. vary is expected to be sorted.
+// varyKey 根据基础 key 与请求中 Vary 头名对应的值生成变体缓存 key。
+// vary 应已排序。
+func varyKey(base string, vary []string, r *http.Request) string {
+	key := base
+	for _, name := range vary {
+		key += "|" + url.QueryEscape(strings.ToLower(name)) + "=" + url.QueryEscape(r.Header.Get(name))
+	}
+	return key
+}
+
 // cacheKey builds the Redis key from path and query string, without the method.
 // cacheKey 根据路径与查询串生成 Redis key，不包含 method。
 func cacheKey(r *http.Request) string {
@@ -373,13 +422,15 @@ func cacheKey(r *http.Request) string {
 }
 
 // ttlForStatus returns the TTL to cache with, or -1 when the response should
-// not be cached. 2xx uses ttl; 404 uses a short TTL to prevent penetration;
-// other statuses are not cached.
+// not be cached. 2xx and extra status codes use ttl; 404 uses a short TTL to
+// prevent penetration; other statuses are not cached.
 // ttlForStatus 返回写缓存应使用的 TTL；返回 -1 表示不应缓存。
-// 2xx 使用 ttl；404 使用短 TTL 防穿透；其他状态码不缓存。
-func ttlForStatus(ttl time.Duration, status int) time.Duration {
+// 2xx 与额外状态码使用 ttl；404 使用短 TTL 防穿透；其他状态码不缓存。
+func ttlForStatus(ttl time.Duration, status int, extra map[int]bool) time.Duration {
 	switch {
 	case status >= 200 && status < 300:
+		return ttl
+	case extra[status]:
 		return ttl
 	case status == http.StatusNotFound:
 		if ttl <= 0 || ttl > EmptyCacheTTL {
@@ -391,20 +442,88 @@ func ttlForStatus(ttl time.Duration, status int) time.Duration {
 	}
 }
 
+// filteredHeaders returns a copy of the response headers with hop-by-hop
+// headers and Set-Cookie removed. It returns nil when nothing remains.
+// filteredHeaders 返回剔除 hop-by-hop 头与 Set-Cookie 后的响应头副本；
+// 无剩余内容时返回 nil。
+func filteredHeaders(h http.Header) http.Header {
+	excluded := map[string]bool{
+		"Connection":          true,
+		"Keep-Alive":          true,
+		"Transfer-Encoding":   true,
+		"Upgrade":             true,
+		"Proxy-Authenticate":  true,
+		"Proxy-Authorization": true,
+		"TE":                  true,
+		"Trailer":             true,
+		"Set-Cookie":          true,
+	}
+	// Headers listed by Connection are also hop-by-hop.
+	// Connection 中列出的头同样视为 hop-by-hop。
+	for _, v := range h.Values("Connection") {
+		for _, name := range strings.Split(v, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				excluded[http.CanonicalHeaderKey(name)] = true
+			}
+		}
+	}
+
+	filtered := make(http.Header, len(h))
+	for k, vv := range h {
+		if len(vv) == 0 || excluded[http.CanonicalHeaderKey(k)] {
+			continue
+		}
+		filtered[k] = append([]string(nil), vv...)
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return filtered
+}
+
 // store serializes the captured response and writes it to Redis. It reports
-// whether the response was actually cached; oversized or streamed responses
-// are skipped without error.
+// whether the response was actually cached; oversized, streamed or Vary: *
+// responses are skipped without error. Hop-by-hop headers and Set-Cookie are
+// filtered from the cached headers. Vary responses are stored under a variant
+// key with a base index entry.
 // store 序列化捕获的响应并写入 Redis，返回是否真正写入了缓存。
-// 过大或流式响应会被跳过且不返回错误。
-func store(client *redis.Client, ctx context.Context, key string, w *cacheWriter, ttl time.Duration) (bool, error) {
+// 过大、流式或 Vary: * 的响应会被跳过且不返回错误。缓存头会剔除
+// hop-by-hop 头与 Set-Cookie。带 Vary 的响应按变体 key 存储，并在基础 key
+// 写入索引条目。
+func store(client *redis.Client, ctx context.Context, key string, r *http.Request, w *cacheWriter, ttl time.Duration) (bool, error) {
 	if w.tooBig || w.streamed {
 		return false, nil
 	}
 	entry := cacheEntry{
-		Status:      w.status,
-		ContentType: w.Header().Get("Content-Type"),
-		Body:        w.body.Bytes(),
+		Status: w.status,
+		Body:   w.body.Bytes(),
 	}
+	if headers := filteredHeaders(w.Header()); headers != nil {
+		entry.Headers = headers
+	} else {
+		entry.ContentType = w.Header().Get("Content-Type")
+	}
+
+	vary, noCache := parseVary(w.Header().Values("Vary"))
+	if noCache {
+		return false, nil
+	}
+	if len(vary) == 0 {
+		return storeEntry(client, ctx, key, entry, ttl)
+	}
+	if _, err := storeEntry(client, ctx, varyKey(key, vary, r), entry, ttl); err != nil {
+		return false, err
+	}
+	index := cacheEntry{Vary: vary}
+	if _, err := storeEntry(client, ctx, key, index, ttl); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// storeEntry marshals one cache entry and writes it to Redis.
+// storeEntry 序列化单个缓存条目并写入 Redis。
+func storeEntry(client *redis.Client, ctx context.Context, key string, entry cacheEntry, ttl time.Duration) (bool, error) {
 	data, err := json.Marshal(entry)
 	if err != nil {
 		return false, err
@@ -415,20 +534,29 @@ func store(client *redis.Client, ctx context.Context, key string, w *cacheWriter
 	return true, nil
 }
 
-// writeCached decodes a cached payload and replays it to the response writer.
-// When headOnly is true only status and Content-Type are replayed.
-// It returns an error when the cached value is invalid and cannot be replayed.
-// writeCached 解码缓存载荷并回放到响应 writer。headOnly 为 true 时只回放
-// 状态码与 Content-Type。缓存值无效时返回错误。
-func writeCached(w http.ResponseWriter, val string, headOnly bool) error {
+// decodeCacheEntry unmarshals a cached payload.
+// decodeCacheEntry 反序列化缓存载荷。
+func decodeCacheEntry(val string) (cacheEntry, error) {
 	var entry cacheEntry
-	if err := json.Unmarshal([]byte(val), &entry); err != nil {
-		return err
-	}
+	err := json.Unmarshal([]byte(val), &entry)
+	return entry, err
+}
+
+// replayCacheEntry writes a decoded cache entry to the response writer.
+// When headOnly is true only status and headers are replayed.
+// replayCacheEntry 将解码后的缓存条目回放到响应 writer。
+// headOnly 为 true 时只回放状态码与响应头。
+func replayCacheEntry(w http.ResponseWriter, entry cacheEntry, headOnly bool) error {
 	if entry.Status < 100 || entry.Status > 999 {
 		return fmt.Errorf("invalid cached status %d", entry.Status)
 	}
-	if entry.ContentType != "" {
+	if entry.Headers != nil {
+		for k, vv := range entry.Headers {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+	} else if entry.ContentType != "" {
 		w.Header().Set("Content-Type", entry.ContentType)
 	}
 	w.WriteHeader(entry.Status)
@@ -436,6 +564,37 @@ func writeCached(w http.ResponseWriter, val string, headOnly bool) error {
 		w.Write(entry.Body)
 	}
 	return nil
+}
+
+// lookupAndReplay reads the cache for key and replays the matching variant.
+// A base entry carrying Vary is an index: the actual content is stored under
+// varyKey(base, vary, r). It returns (hit, err); a redis.Nil err means miss.
+// lookupAndReplay 读取 key 对应缓存并回放匹配的变体。带 Vary 的基础条目是索引，
+// 实际内容存在 varyKey(base, vary, r) 下。返回 (hit, err)；
+// err 为 redis.Nil 表示未命中。
+func lookupAndReplay(w http.ResponseWriter, client *redis.Client, ctx context.Context, key string, r *http.Request, headOnly bool) (bool, error) {
+	val, err := getWithTimeout(client, ctx, key)
+	if err != nil {
+		return false, err
+	}
+	entry, err := decodeCacheEntry(val)
+	if err != nil {
+		return false, err
+	}
+	if len(entry.Vary) > 0 {
+		val, err = getWithTimeout(client, ctx, varyKey(key, entry.Vary, r))
+		if err != nil {
+			return false, err
+		}
+		entry, err = decodeCacheEntry(val)
+		if err != nil {
+			return false, err
+		}
+	}
+	if err := replayCacheEntry(w, entry, headOnly); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // getWithTimeout runs client.Get with a short timeout.

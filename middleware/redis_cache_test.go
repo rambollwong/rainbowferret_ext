@@ -480,3 +480,213 @@ func TestRedisCacheMetrics(t *testing.T) {
 		t.Fatalf("unexpected keys: %+v", events)
 	}
 }
+
+func TestRedisCacheSkips302ByDefault(t *testing.T) {
+	client := newTestRedis(t)
+	mw := RedisCache(client, time.Minute, nil)
+
+	calls := 0
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Location", "/target")
+		w.WriteHeader(http.StatusFound)
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/redirect-default", nil))
+	if rec.Code != http.StatusFound {
+		t.Fatalf("first status: %d", rec.Code)
+	}
+
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/redirect-default", nil))
+	if rec2.Code != http.StatusFound {
+		t.Fatalf("second status: %d", rec2.Code)
+	}
+	if calls != 2 {
+		t.Fatalf("302 should not be cached by default, calls=%d", calls)
+	}
+}
+
+func TestRedisCacheCachesExtraStatusWithLocation(t *testing.T) {
+	client := newTestRedis(t)
+	mw := RedisCache(client, time.Minute, nil, http.StatusFound)
+
+	calls := 0
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Location", "/target")
+		w.Header().Set("X-Custom", "yes")
+		w.WriteHeader(http.StatusFound)
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/redirect", nil))
+	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/target" {
+		t.Fatalf("first response: code=%d location=%q", rec.Code, rec.Header().Get("Location"))
+	}
+
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/redirect", nil))
+	if rec2.Code != http.StatusFound {
+		t.Fatalf("cached status: %d", rec2.Code)
+	}
+	if rec2.Header().Get("Location") != "/target" {
+		t.Fatalf("cached Location: %q", rec2.Header().Get("Location"))
+	}
+	if rec2.Header().Get("X-Custom") != "yes" {
+		t.Fatalf("cached X-Custom: %q", rec2.Header().Get("X-Custom"))
+	}
+	if calls != 1 {
+		t.Fatalf("302 with extra status should be cached, calls=%d", calls)
+	}
+}
+
+func TestRedisCacheCachesFullHeadersOnCacheControlPublic(t *testing.T) {
+	client := newTestRedis(t)
+	mw := RedisCache(client, time.Minute, nil)
+
+	calls := 0
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Cache-Control", "public, max-age=60")
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("X-Custom", "hello")
+		w.Write([]byte("ok"))
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/public", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
+		t.Fatalf("first response: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/public", nil))
+	if rec2.Body.String() != "ok" {
+		t.Fatalf("cached body: %q", rec2.Body.String())
+	}
+	if rec2.Header().Get("X-Custom") != "hello" {
+		t.Fatalf("cached X-Custom: %q", rec2.Header().Get("X-Custom"))
+	}
+	if rec2.Header().Get("Cache-Control") != "public, max-age=60" {
+		t.Fatalf("cached Cache-Control: %q", rec2.Header().Get("Cache-Control"))
+	}
+	if calls != 1 {
+		t.Fatalf("public response should be cached, calls=%d", calls)
+	}
+}
+
+func TestRedisCacheFiltersDangerousHeaders(t *testing.T) {
+	client := newTestRedis(t)
+	mw := RedisCache(client, time.Minute, nil)
+
+	calls := 0
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("X-Keep", "yes")
+		w.Header().Set("Set-Cookie", "session=abc")
+		w.Header().Set("Connection", "X-Hop")
+		w.Header().Set("X-Hop", "hop")
+		w.Write([]byte("ok"))
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/headers", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first status: %d", rec.Code)
+	}
+
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/headers", nil))
+	if rec2.Code != http.StatusOK || rec2.Body.String() != "ok" {
+		t.Fatalf("cached response: code=%d body=%q", rec2.Code, rec2.Body.String())
+	}
+	if rec2.Header().Get("X-Keep") != "yes" {
+		t.Fatalf("X-Keep should be cached: %q", rec2.Header().Get("X-Keep"))
+	}
+	if rec2.Header().Get("Set-Cookie") != "" {
+		t.Fatalf("Set-Cookie should be filtered, got %q", rec2.Header().Get("Set-Cookie"))
+	}
+	if rec2.Header().Get("X-Hop") != "" {
+		t.Fatalf("Connection-listed header should be filtered, got %q", rec2.Header().Get("X-Hop"))
+	}
+	if rec2.Header().Get("Connection") != "" {
+		t.Fatalf("Connection should be filtered, got %q", rec2.Header().Get("Connection"))
+	}
+	if calls != 1 {
+		t.Fatalf("response should be cached, calls=%d", calls)
+	}
+}
+
+func TestRedisCacheVaryVariants(t *testing.T) {
+	client := newTestRedis(t)
+	mw := RedisCache(client, time.Minute, nil)
+
+	calls := 0
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Vary", "Accept-Encoding")
+		w.Write([]byte("encoding=" + r.Header.Get("Accept-Encoding")))
+	}))
+
+	reqGzip := httptest.NewRequest(http.MethodGet, "/vary", nil)
+	reqGzip.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, reqGzip)
+	if rec.Body.String() != "encoding=gzip" {
+		t.Fatalf("gzip response: %q", rec.Body.String())
+	}
+
+	reqIdentity := httptest.NewRequest(http.MethodGet, "/vary", nil)
+	reqIdentity.Header.Set("Accept-Encoding", "identity")
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, reqIdentity)
+	if rec2.Body.String() != "encoding=identity" {
+		t.Fatalf("identity response: %q", rec2.Body.String())
+	}
+	if calls != 2 {
+		t.Fatalf("different variants should each miss, calls=%d", calls)
+	}
+
+	reqGzip2 := httptest.NewRequest(http.MethodGet, "/vary", nil)
+	reqGzip2.Header.Set("Accept-Encoding", "gzip")
+	rec3 := httptest.NewRecorder()
+	handler.ServeHTTP(rec3, reqGzip2)
+	if rec3.Body.String() != "encoding=gzip" {
+		t.Fatalf("gzip cached response: %q", rec3.Body.String())
+	}
+	if rec3.Header().Get("Vary") != "Accept-Encoding" {
+		t.Fatalf("Vary header should be replayed: %q", rec3.Header().Get("Vary"))
+	}
+	if calls != 2 {
+		t.Fatalf("same variant should hit cache, calls=%d", calls)
+	}
+}
+
+func TestRedisCacheVaryStarSkipsCache(t *testing.T) {
+	client := newTestRedis(t)
+	mw := RedisCache(client, time.Minute, nil)
+
+	calls := 0
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Vary", "*")
+		w.Write([]byte("unstable"))
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/vary-star", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first status: %d", rec.Code)
+	}
+
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/vary-star", nil))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second status: %d", rec2.Code)
+	}
+	if calls != 2 {
+		t.Fatalf("Vary: * should not be cached, calls=%d", calls)
+	}
+}
