@@ -19,6 +19,7 @@ type responseWriter struct {
 }
 
 // WriteHeader captures the status code and delegates to the underlying writer.
+//
 // WriteHeader 捕获状态码并委托给底层 writer。
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.status = code

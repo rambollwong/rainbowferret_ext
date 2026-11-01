@@ -27,34 +27,41 @@ import (
 // 请求进行中修改存在并发风险。
 var (
 	// CacheKeyPrefix is the Redis key namespace for cached entries.
+	//
 	// CacheKeyPrefix 是缓存项的 Redis key 命名空间。
 	CacheKeyPrefix = "ferret:cache:"
 
 	// EmptyCacheTTL is the TTL used for 404 placeholder entries that prevent
 	// cache penetration.
+	//
 	// EmptyCacheTTL 是 404 占位项的 TTL，用于防止缓存穿透。
 	EmptyCacheTTL = 30 * time.Second
 
 	// MaxCacheBodyBytes is the largest response body that will be cached.
+	//
 	// MaxCacheBodyBytes 是可被缓存的最大响应体字节数。
 	MaxCacheBodyBytes = 1 << 20 // 1 MiB
 
 	// RedisOpTimeout bounds every Redis operation made by the middleware.
+	//
 	// RedisOpTimeout 是中间件每次 Redis 操作的超时。
 	RedisOpTimeout = 200 * time.Millisecond
 
 	// BreakerFailureThreshold is the number of consecutive Redis failures
 	// that opens the circuit breaker.
+	//
 	// BreakerFailureThreshold 是打开熔断所需的连续 Redis 失败次数。
 	BreakerFailureThreshold = 3
 
 	// BreakerCooldown is how long the circuit breaker stays open.
+	//
 	// BreakerCooldown 是熔断打开后的冷却时长。
 	BreakerCooldown = 30 * time.Second
 
 	// ExcludedHeaders lists response headers that are never cached. It
 	// defaults to hop-by-hop headers, Set-Cookie, and per-request tracing
 	// headers such as X-Request-Id.
+	//
 	// ExcludedHeaders 列出永不缓存的响应头。默认包含 hop-by-hop 头、
 	// Set-Cookie 以及 X-Request-Id 等每次请求都不同的链路追踪头。
 	ExcludedHeaders = map[string]bool{
@@ -82,20 +89,24 @@ var (
 )
 
 // CacheMetricEvent identifies the kind of cache metric event.
+//
 // CacheMetricEvent 标识缓存指标事件类型。
 type CacheMetricEvent string
 
 const (
 	// CacheMetricHit means the response was served from cache.
+	//
 	// CacheMetricHit 表示响应来自缓存。
 	CacheMetricHit CacheMetricEvent = "hit"
 
 	// CacheMetricMiss means the cache had no usable entry and the handler ran.
+	//
 	// CacheMetricMiss 表示缓存无可用条目，执行了 handler。
 	CacheMetricMiss CacheMetricEvent = "miss"
 )
 
 // CacheMetric is reported through OnCacheMetric for GET/HEAD cache lookups.
+//
 // CacheMetric 通过 OnCacheMetric 上报 GET/HEAD 缓存查询结果。
 type CacheMetric struct {
 	Event  CacheMetricEvent
@@ -105,11 +116,13 @@ type CacheMetric struct {
 
 // OnCacheMetric, when non-nil, receives one event per GET/HEAD cache lookup.
 // Configure it before creating the middleware.
+//
 // OnCacheMetric 非 nil 时，每次 GET/HEAD 缓存查询上报一个事件。
 // 请在创建中间件前配置。
 var OnCacheMetric func(CacheMetric)
 
 // reportMetric dispatches a cache metric event.
+//
 // reportMetric 分发缓存指标事件。
 func reportMetric(event CacheMetricEvent, key, method string) {
 	if OnCacheMetric != nil {
@@ -119,6 +132,7 @@ func reportMetric(event CacheMetricEvent, key, method string) {
 
 // cacheEntry is the payload stored in Redis: the response status code,
 // Content-Type (or full headers when applicable) and body.
+//
 // cacheEntry 是存入 Redis 的载荷：状态码、Content-Type（或适用时的完整响应头）与响应体。
 type cacheEntry struct {
 	Status      int         `json:"status"`
@@ -129,6 +143,7 @@ type cacheEntry struct {
 }
 
 // cacheWriter captures the response status and body for caching.
+//
 // cacheWriter 捕获响应状态码与响应体，用于写入缓存。
 type cacheWriter struct {
 	http.ResponseWriter
@@ -139,6 +154,7 @@ type cacheWriter struct {
 }
 
 // WriteHeader captures the status code and delegates to the underlying writer.
+//
 // WriteHeader 捕获状态码并委托给底层 writer。
 func (w *cacheWriter) WriteHeader(code int) {
 	if w.status != 0 {
@@ -151,6 +167,7 @@ func (w *cacheWriter) WriteHeader(code int) {
 // Write records the body and writes it through. It defaults the status to 200
 // when WriteHeader has not been called. Bodies larger than MaxCacheBodyBytes
 // are not captured.
+//
 // Write 记录响应体并透传写入。未显式调用 WriteHeader 时状态码默认为 200。
 // 超过 MaxCacheBodyBytes 的响应体不会被捕获。
 func (w *cacheWriter) Write(b []byte) (int, error) {
@@ -170,6 +187,7 @@ func (w *cacheWriter) Write(b []byte) (int, error) {
 
 // Flush marks the response as streamed and forwards Flush to the underlying
 // writer when supported. Streamed responses are never cached.
+//
 // Flush 将响应标记为流式，并在底层 writer 支持时透传 Flush。流式响应不缓存。
 func (w *cacheWriter) Flush() {
 	w.streamed = true
@@ -180,6 +198,7 @@ func (w *cacheWriter) Flush() {
 
 // Hijack marks the response as hijacked and forwards the call to the
 // underlying writer when supported. Hijacked responses are never cached.
+//
 // Hijack 将响应标记为已劫持，并在底层 writer 支持时透传。已劫持响应不缓存。
 func (w *cacheWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	w.streamed = true
@@ -193,6 +212,7 @@ func (w *cacheWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 // cacheBreaker is a tiny circuit breaker for Redis operations. After
 // BreakerFailureThreshold consecutive failures it opens for BreakerCooldown,
 // during which all Redis operations are skipped.
+//
 // cacheBreaker 是 Redis 操作的小型熔断器。连续失败达到 BreakerFailureThreshold 次后
 // 打开熔断并保持 BreakerCooldown，期间跳过所有 Redis 操作。
 type cacheBreaker struct {
@@ -375,6 +395,7 @@ func RedisCache(client *redis.Client, ttl time.Duration, onError func(error), ex
 // cacheAndRecord stores the captured response when applicable and updates the
 // breaker. Skipped responses (not cacheable, too big, streamed) leave the
 // breaker untouched.
+//
 // cacheAndRecord 在适用时写入捕获的响应并更新熔断器。被跳过的响应
 // （不可缓存、过大、流式）不改变熔断器状态。
 func cacheAndRecord(breaker *cacheBreaker, client *redis.Client, ctx context.Context, key string, r *http.Request, w *cacheWriter, ttl time.Duration, onError func(error), extra map[int]bool) {
@@ -397,6 +418,7 @@ func cacheAndRecord(breaker *cacheBreaker, client *redis.Client, ctx context.Con
 }
 
 // report invokes onError when non-nil; otherwise the error is ignored.
+//
 // report 在 onError 非 nil 时调用它；否则忽略错误。
 func report(onError func(error), err error) {
 	if onError != nil {
@@ -407,6 +429,7 @@ func report(onError func(error), err error) {
 // parseVary parses the Vary header values into a sorted, deduplicated header
 // name list. It reports noCache=true when Vary: * makes the response
 // uncacheable per variant.
+//
 // parseVary 将 Vary 头解析为去重排序的头名列表。出现 Vary: * 时
 // 返回 noCache=true，表示无法按变体缓存。
 func parseVary(values []string) (vary []string, noCache bool) {
@@ -429,6 +452,7 @@ func parseVary(values []string) (vary []string, noCache bool) {
 
 // varyKey builds the variant cache key for a base key and the request's values
 // of the Vary header names. vary is expected to be sorted.
+//
 // varyKey 根据基础 key 与请求中 Vary 头名对应的值生成变体缓存 key。
 // vary 应已排序。
 func varyKey(base string, vary []string, r *http.Request) string {
@@ -440,6 +464,7 @@ func varyKey(base string, vary []string, r *http.Request) string {
 }
 
 // cacheKey builds the Redis key from path and query string, without the method.
+//
 // cacheKey 根据路径与查询串生成 Redis key，不包含 method。
 func cacheKey(r *http.Request) string {
 	key := CacheKeyPrefix + r.URL.Path
@@ -452,6 +477,7 @@ func cacheKey(r *http.Request) string {
 // ttlForStatus returns the TTL to cache with, or -1 when the response should
 // not be cached. 2xx and extra status codes use ttl; 404 uses a short TTL to
 // prevent penetration; other statuses are not cached.
+//
 // ttlForStatus 返回写缓存应使用的 TTL；返回 -1 表示不应缓存。
 // 2xx 与额外状态码使用 ttl；404 使用短 TTL 防穿透；其他状态码不缓存。
 func ttlForStatus(ttl time.Duration, status int, extra map[int]bool) time.Duration {
@@ -473,6 +499,7 @@ func ttlForStatus(ttl time.Duration, status int, extra map[int]bool) time.Durati
 // filteredHeaders returns a copy of the response headers with ExcludedHeaders
 // removed, plus any headers listed by Connection. It returns nil when nothing
 // remains.
+//
 // filteredHeaders 返回剔除 ExcludedHeaders 以及 Connection 中所列头之后的
 // 响应头副本；无剩余内容时返回 nil。
 func filteredHeaders(h http.Header) http.Header {
@@ -483,6 +510,7 @@ func filteredHeaders(h http.Header) http.Header {
 		}
 	}
 	// Headers listed by Connection are also hop-by-hop.
+	//
 	// Connection 中列出的头同样视为 hop-by-hop。
 	for _, v := range h.Values("Connection") {
 		for _, name := range strings.Split(v, ",") {
@@ -510,6 +538,7 @@ func filteredHeaders(h http.Header) http.Header {
 // responses are skipped without error. Headers listed in ExcludedHeaders are
 // filtered from the cached headers. Vary responses are stored under a variant
 // key with a base index entry.
+//
 // store 序列化捕获的响应并写入 Redis，返回是否真正写入了缓存。
 // 过大、流式或 Vary: * 的响应会被跳过且不返回错误。缓存头会剔除
 // ExcludedHeaders 中列出的头。带 Vary 的响应按变体 key 存储，并在基础 key
@@ -546,6 +575,7 @@ func store(client *redis.Client, ctx context.Context, key string, r *http.Reques
 }
 
 // storeEntry marshals one cache entry and writes it to Redis.
+//
 // storeEntry 序列化单个缓存条目并写入 Redis。
 func storeEntry(client *redis.Client, ctx context.Context, key string, entry cacheEntry, ttl time.Duration) (bool, error) {
 	data, err := json.Marshal(entry)
@@ -559,6 +589,7 @@ func storeEntry(client *redis.Client, ctx context.Context, key string, entry cac
 }
 
 // decodeCacheEntry unmarshals a cached payload.
+//
 // decodeCacheEntry 反序列化缓存载荷。
 func decodeCacheEntry(val string) (cacheEntry, error) {
 	var entry cacheEntry
@@ -568,6 +599,7 @@ func decodeCacheEntry(val string) (cacheEntry, error) {
 
 // replayCacheEntry writes a decoded cache entry to the response writer.
 // When headOnly is true only status and headers are replayed.
+//
 // replayCacheEntry 将解码后的缓存条目回放到响应 writer。
 // headOnly 为 true 时只回放状态码与响应头。
 func replayCacheEntry(w http.ResponseWriter, entry cacheEntry, headOnly bool) error {
@@ -593,6 +625,7 @@ func replayCacheEntry(w http.ResponseWriter, entry cacheEntry, headOnly bool) er
 // lookupAndReplay reads the cache for key and replays the matching variant.
 // A base entry carrying Vary is an index: the actual content is stored under
 // varyKey(base, vary, r). It returns (hit, err); a redis.Nil err means miss.
+//
 // lookupAndReplay 读取 key 对应缓存并回放匹配的变体。带 Vary 的基础条目是索引，
 // 实际内容存在 varyKey(base, vary, r) 下。返回 (hit, err)；
 // err 为 redis.Nil 表示未命中。
@@ -622,6 +655,7 @@ func lookupAndReplay(w http.ResponseWriter, client *redis.Client, ctx context.Co
 }
 
 // getWithTimeout runs client.Get with a short timeout.
+//
 // getWithTimeout 以短超时执行 client.Get。
 func getWithTimeout(client *redis.Client, ctx context.Context, key string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, RedisOpTimeout)
@@ -630,6 +664,7 @@ func getWithTimeout(client *redis.Client, ctx context.Context, key string) (stri
 }
 
 // setWithTimeout runs client.Set with a short timeout.
+//
 // setWithTimeout 以短超时执行 client.Set。
 func setWithTimeout(client *redis.Client, ctx context.Context, key string, data []byte, ttl time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, RedisOpTimeout)
@@ -638,6 +673,7 @@ func setWithTimeout(client *redis.Client, ctx context.Context, key string, data 
 }
 
 // delWithTimeout runs client.Del with a short timeout.
+//
 // delWithTimeout 以短超时执行 client.Del。
 func delWithTimeout(client *redis.Client, ctx context.Context, key string) error {
 	ctx, cancel := context.WithTimeout(ctx, RedisOpTimeout)
